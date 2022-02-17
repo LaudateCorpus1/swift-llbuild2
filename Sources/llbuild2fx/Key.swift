@@ -15,11 +15,16 @@ public protocol FXKey: Encodable, FXVersioning {
 
     static var volatile: Bool { get }
 
+    // A concise, human readable contents summary that may be used in otherwise
+    // hashed contexts (i.e. when stored in caches, etc.)
+    var hint: String? { get }
+
     func computeValue(_ fi: FXFunctionInterface<Self>, _ ctx: Context) -> LLBFuture<ValueType>
 }
 
 extension FXKey {
     public static var volatile: Bool { false }
+    public var hint: String? { nil }
 }
 
 
@@ -66,7 +71,13 @@ extension InternalKey: FXKeyProperties {
         }
 
         let hash = LLBDataID(blake3hash: ArraySlice<UInt8>(json))
-        let str = ArraySlice(hash.bytes.dropFirst().prefix(9)).base64URL()
+        let hashStr = ArraySlice(hash.bytes.dropFirst().prefix(9)).base64URL()
+        let str: String
+        if let hint = key.hint {
+            str = "\(hint) \(hashStr)"
+        } else {
+            str = hashStr
+        }
         return [basePath, str].joined(separator: "/")
     }
 }
@@ -106,12 +117,13 @@ extension InternalKey: FXFunctionProvider {
     }
 }
 
-final class FXFunction<K: FXKey>: LLBTypedCachingFunction<InternalKey<K>, InternalValue<K.ValueType>> {
-    enum Error: Swift.Error {
-        case FXValueComputationError(keyPrefix: String, key: String, error: Swift.Error)
-        case FXKeyEncodingError(keyPrefix: String, encodingError: Swift.Error, underlyingError: Swift.Error)
-    }
+public enum FXError: Swift.Error {
+    case FXValueComputationError(keyPrefix: String, key: String, error: Swift.Error, requestedCacheKeyPaths: FXSortedSet<String>)
+    case FXKeyEncodingError(keyPrefix: String, encodingError: Swift.Error, underlyingError: Swift.Error)
+}
 
+
+final class FXFunction<K: FXKey>: LLBTypedCachingFunction<InternalKey<K>, InternalValue<K.ValueType>> {
     override func compute(key: InternalKey<K>, _ fi: LLBFunctionInterface, _ ctx: Context) -> LLBFuture<
         InternalValue<K.ValueType>
     > {
@@ -126,13 +138,14 @@ final class FXFunction<K: FXKey>: LLBTypedCachingFunction<InternalKey<K>, Intern
             do {
                 let keyData = try FXEncoder().encode(actualKey)
                 let encodedKey = String(bytes: keyData, encoding: .utf8)!
-                augmentedError = Error.FXValueComputationError(
+                augmentedError = FXError.FXValueComputationError(
                     keyPrefix: K.cacheKeyPrefix,
                     key: encodedKey,
-                    error: underlyingError
+                    error: underlyingError,
+                    requestedCacheKeyPaths: fxfi.requestedCacheKeyPathsSnapshot
                 )
             } catch {
-                augmentedError = Error.FXKeyEncodingError(
+                augmentedError = FXError.FXKeyEncodingError(
                     keyPrefix: K.cacheKeyPrefix,
                     encodingError: error,
                     underlyingError: underlyingError
